@@ -1,6 +1,7 @@
 """Optional provider adapter. Rule-based processing remains available without credentials."""
 import json, os
 from typing import Protocol
+from app.core.config import settings
 from app.services.cleaning import SCHEMA
 
 class ExtractionProvider(Protocol):
@@ -9,8 +10,8 @@ class ExtractionProvider(Protocol):
 class AnthropicProvider:
     def __init__(self):
         import anthropic
-        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"], timeout=12.0, max_retries=1)
-        self.model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key, timeout=12.0, max_retries=1)
+        self.model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
     def extract_invoice(self, text: str) -> dict:
         response = self.client.messages.create(
@@ -40,11 +41,11 @@ class AnthropicProvider:
         return result
 
 def extract_invoice(text: str) -> tuple[dict | None, str | None]:
-    if not os.getenv("ANTHROPIC_API_KEY"): return None, "Invoice extraction is unavailable until an LLM provider is configured"
+    if not settings.anthropic_api_key: return None, "Invoice extraction is unavailable until an LLM provider is configured"
     try: return AnthropicProvider().extract_invoice(text), None
     except Exception: return None, "Invoice extraction needs review; automatic extraction could not be completed"
 
 def map_columns(columns: list[str], existing: dict) -> dict:
-    if not os.getenv("ANTHROPIC_API_KEY"): return existing
+    if not settings.anthropic_api_key: return existing
     try: return AnthropicProvider().map_columns(columns,existing)
     except Exception: return existing

@@ -75,13 +75,14 @@ def process_file(db: Session, file_id: int):
                 mapping=f.mapping or suggest_mapping(chunk.columns)
                 if not f.mapping:
                     from app.services.llm import map_columns
-                    mapping=map_columns([str(c) for c in chunk.columns],mapping)
+                    if f.allow_ai:
+                        mapping=map_columns([str(c) for c in chunk.columns],mapping)
             for item in chunk.to_dict(orient="records"):
                 raw = {str(k): (None if pd.isna(v) else str(v)) for k, v in item.items()}
                 source_raw = raw
                 if "document_text" in raw:
                     from app.services.llm import extract_invoice
-                    extracted, note = extract_invoice(raw.get("document_text") or "")
+                    extracted, note = extract_invoice(raw.get("document_text") or "") if f.allow_ai else (None, "AI extraction was not enabled for this upload")
                     if extracted:
                         source_raw = extracted
                         mapping = {key:key for key in extracted}

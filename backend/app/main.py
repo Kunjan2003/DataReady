@@ -1,47 +1,93 @@
 from pathlib import Path
 from uuid import uuid4
 import io, csv, json
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, case, or_, cast, Text
+from collections import defaultdict, deque
+from threading import Lock
+from time import monotonic
+from alembic import command
+from alembic.config import Config
 from app.core.config import settings
-from app.db.init import init_db
 from app.api.deps import get_db, current_user
 from app.models.models import User, Project, UploadedFile, Record, AuditLog
+from app.db.session import engine
 from app.services.auth import hash_password, verify_password, create_token
 from app.services.processing import process_file
 from app.services.cleaning import SCHEMA, suggest_mapping
 from app.services.dedup import merge_records
+from app.core.security import validate_upload
 
 app = FastAPI(title="DataReady API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 ALLOWED = {".xlsx", ".xls", ".csv", ".pdf", ".jpg", ".jpeg", ".png"}
+_auth_attempts = defaultdict(deque)
+_auth_lock = Lock()
+
+def auth_rate_limit(request: Request):
+    now = monotonic()
+    key = request.client.host if request.client else "unknown"
+    with _auth_lock:
+        attempts = _auth_attempts[key]
+        while attempts and now - attempts[0] > 900:
+            attempts.popleft()
+        if len(attempts) >= 10:
+            raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes.")
+        attempts.append(now)
+
+@app.middleware("http")
+async def protect_cookie_mutations(request: Request, call_next):
+    if request.method in {"POST","PUT","PATCH","DELETE"} and request.cookies.get("dataready_session"):
+        origin=request.headers.get("origin","").rstrip("/")
+        if not origin or origin not in settings.allowed_origins:
+            return Response("Request origin is not allowed",status_code=403)
+    return await call_next(request)
 
 @app.on_event("startup")
 def startup():
     settings.upload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    init_db()
+    alembic_cfg=Config(str(Path(__file__).resolve().parents[1]/"alembic.ini"))
+    alembic_cfg.set_main_option("script_location",str(Path(__file__).resolve().parents[1]/"alembic"))
+    from sqlalchemy import inspect
+    schema=inspect(engine)
+    if schema.has_table("users") and not schema.has_table("alembic_version"):
+        # Upgrade databases created by the original MVP schema in place.
+        command.stamp(alembic_cfg,"0001_initial")
+    command.upgrade(alembic_cfg,"head")
 
 @app.get("/health")
 def health(): return {"status": "ok"}
 
+def auth_cookie(response: Response, token: str):
+    response.set_cookie("dataready_session",token,max_age=86400,httponly=True,secure=settings.cookie_secure,samesite="strict",path="/")
+
 @app.post("/api/auth/signup")
-def signup(payload: dict, db: Session = Depends(get_db)):
+def signup(payload: dict, response: Response, request: Request, db: Session = Depends(get_db)):
+    auth_rate_limit(request)
     email = str(payload.get("email", "")).strip().lower(); password = str(payload.get("password", ""))
     if "@" not in email or len(email) > 320: raise HTTPException(422, "Enter a valid email address")
     try: password_hash = hash_password(password)
     except ValueError as exc: raise HTTPException(422, str(exc))
     if db.query(User).filter_by(email=email).first(): raise HTTPException(409, "An account with this email already exists")
     user = User(email=email, password_hash=password_hash); db.add(user); db.commit(); db.refresh(user)
-    return {"token": create_token(user.id), "user": {"id": user.id, "email": user.email}}
+    auth_cookie(response,create_token(user.id))
+    return {"user": {"id": user.id, "email": user.email}}
 
 @app.post("/api/auth/login")
-def login(payload: dict, db: Session = Depends(get_db)):
+def login(payload: dict, response: Response, request: Request, db: Session = Depends(get_db)):
+    auth_rate_limit(request)
     email = str(payload.get("email", "")).strip().lower(); user = db.query(User).filter_by(email=email).first()
     if not user or not verify_password(str(payload.get("password", "")), user.password_hash): raise HTTPException(401, "Email or password is incorrect")
-    return {"token": create_token(user.id), "user": {"id": user.id, "email": user.email}}
+    auth_cookie(response,create_token(user.id))
+    return {"user": {"id": user.id, "email": user.email}}
+
+@app.post("/api/auth/logout")
+def logout(response:Response):
+    response.delete_cookie("dataready_session",path="/",httponly=True,secure=settings.cookie_secure,samesite="strict")
+    return {"ok":True}
 
 @app.get("/api/me")
 def me(user: User = Depends(current_user)): return {"id": user.id, "email": user.email}
@@ -74,7 +120,7 @@ def delete_project(project_id:int, db:Session=Depends(get_db), user:User=Depends
     db.delete(p);db.commit();return {"ok":True}
 
 @app.post("/api/projects/{project_id}/files")
-async def upload(project_id:int, background:BackgroundTasks, files:list[UploadFile]=File(...), db:Session=Depends(get_db), user:User=Depends(current_user)):
+async def upload(project_id:int, background:BackgroundTasks, files:list[UploadFile]=File(...), allow_ai:bool=Form(False), db:Session=Depends(get_db), user:User=Depends(current_user)):
     p=owned_project(db,project_id,user)
     if not files or len(files)>20: raise HTTPException(422,"Upload between 1 and 20 files at a time")
     responses=[]
@@ -90,7 +136,11 @@ async def upload(project_id:int, background:BackgroundTasks, files:list[UploadFi
                     if size>settings.max_upload_mb*1024*1024: raise HTTPException(413,f"Each file must be under {settings.max_upload_mb} MB")
                     out.write(chunk)
             if size==0: raise HTTPException(422,"Empty files cannot be uploaded")
-            f=UploadedFile(project_id=p.id,original_name=Path(item.filename or "upload").name[:255],storage_path=str(path),status="queued");db.add(f);db.commit();db.refresh(f)
+            try:
+                validate_upload(path, suffix, settings.max_expanded_upload_mb)
+            except ValueError as exc:
+                raise HTTPException(415, str(exc)) from exc
+            f=UploadedFile(project_id=p.id,original_name=Path(item.filename or "upload").name[:255],storage_path=str(path),status="queued",allow_ai=allow_ai);db.add(f);db.commit();db.refresh(f)
             try:
                 from redis import Redis
                 from rq import Queue
@@ -132,10 +182,39 @@ def save_mapping(project_id:int,file_id:int,payload:dict,db:Session=Depends(get_
     db.commit();return {"mapping":f.mapping}
 
 @app.get("/api/projects/{project_id}/records")
-def records(project_id:int, limit:int=50, offset:int=0, status:str="active", db:Session=Depends(get_db), user:User=Depends(current_user)):
+def records(project_id:int, limit:int=50, offset:int=0, status:str="active", q:str="", db:Session=Depends(get_db), user:User=Depends(current_user)):
     owned_project(db,project_id,user); limit=max(1,min(limit,200)); query=db.query(Record).filter_by(project_id=project_id,status=status)
+    if q.strip():
+        needle=f"%{q.strip()[:120]}%"
+        query=query.filter(cast(Record.data,Text).ilike(needle))
     total=query.count(); rows=query.order_by(Record.id).offset(offset).limit(limit).all()
     return {"total":total,"items":[{"id":r.id,"file_id":r.file_id,"row_number":r.row_number,"raw":r.raw_data,"data":r.data,"flags":r.quality_flags,"duplicate_of":r.duplicate_of,"score":r.duplicate_score,"status":r.status} for r in rows]}
+
+@app.patch("/api/projects/{project_id}/records/{record_id}")
+def edit_record(project_id:int,record_id:int,payload:dict,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    owned_project(db,project_id,user); record=db.query(Record).filter_by(id=record_id,project_id=project_id,status="active").first()
+    changes=payload.get("data")
+    if not record: raise HTTPException(404,"Record not found")
+    if not isinstance(changes,dict) or not changes or any(k not in SCHEMA for k in changes): raise HTTPException(422,"Provide valid record fields")
+    data=dict(record.data or {})
+    for field,value in changes.items():
+        value=None if value is None else str(value).strip() or None
+        previous=data.get(field)
+        if previous!=value:
+            db.add(AuditLog(project_id=project_id,record_id=record.id,field=field,old_value=None if previous is None else str(previous),new_value=None if value is None else str(value),reason="Field corrected by user"))
+            data[field]=value
+    record.data=data;db.commit();return {"id":record.id,"data":record.data}
+
+@app.post("/api/projects/{project_id}/undo-change/{audit_id}")
+def undo_change(project_id:int,audit_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    owned_project(db,project_id,user);entry=db.query(AuditLog).filter_by(id=audit_id,project_id=project_id).first()
+    if not entry or entry.field not in SCHEMA or entry.record_id is None: raise HTTPException(404,"Undoable change not found")
+    record=db.query(Record).filter_by(id=entry.record_id,project_id=project_id).first()
+    if not record: raise HTTPException(404,"Record not found")
+    data=dict(record.data or {});current=data.get(entry.field)
+    if (None if current is None else str(current)) != entry.new_value: raise HTTPException(409,"This field changed again. Undo the newest change first.")
+    previous=entry.old_value;data[entry.field]=previous;record.data=data
+    db.add(AuditLog(project_id=project_id,record_id=record.id,field=entry.field,old_value=entry.new_value,new_value=previous,reason=f"Undid change {entry.id}"));db.commit();return {"ok":True}
 
 @app.get("/api/projects/{project_id}/review")
 def review(project_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):

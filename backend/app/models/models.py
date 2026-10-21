@@ -32,6 +32,7 @@ class UploadedFile(Base):
     status: Mapped[str] = mapped_column(String(30), default="queued")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     mapping: Mapped[dict] = mapped_column(JSON, default=dict)
+    allow_ai: Mapped[bool] = mapped_column(Boolean, default=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     row_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
